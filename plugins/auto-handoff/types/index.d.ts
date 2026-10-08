@@ -26,6 +26,7 @@ declare module "claude-code" {
       lastVerdict: AutoHandoffVerdict | null;
       signalAge: number;
       checksUsed: number;
+      needsBaseline: boolean;
     };
   }
 }

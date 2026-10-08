@@ -392,6 +392,17 @@ describe("checkpoint switching", () => {
 
     const out = await $.command.run(run(""));
     expect(out.text).toMatch(/Last checkpoint switch just now, at 72%/);
+
+    // Still past the soft threshold after the switch: the next turn's end only
+    // takes a baseline, so it does not switch again on every turn.
+    await $.turn.complete(turnEnd());
+    await clock.settle();
+    expect(seen.checks).toBe(1);
+    seen.percent = 73;
+    await $.turn.complete(turnEnd());
+    await clock.settle();
+    expect(seen.checks).toBe(2);
+    expect(seen.compactions.length).toBe(2);
   });
 
   test("no checkpoint means no switch, and the next check waits for the step", async ($, on) => {
@@ -535,6 +546,10 @@ describe("checkpoint switching", () => {
 
     await $.session.compact({ trigger: "auto", messages: MSGS } as any);
     seen.percent = 71;
+    await $.turn.complete(turnEnd());
+    await clock.settle();
+    expect(seen.checks).toBe(15);
+    seen.percent = 72;
     await $.turn.complete(turnEnd());
     await clock.settle();
     expect(seen.checks).toBe(16);

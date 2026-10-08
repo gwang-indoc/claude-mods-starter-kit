@@ -22,6 +22,7 @@ const COMPACTED_AT = { plugin: "auto-handoff", key: "compactedAt" };
 const VERDICT = { plugin: "auto-handoff", key: "lastVerdict" };
 const SIGNAL_AGE = { plugin: "auto-handoff", key: "signalAge" };
 const CHECKS_USED = { plugin: "auto-handoff", key: "checksUsed" };
+const NEEDS_BASELINE = { plugin: "auto-handoff", key: "needsBaseline" };
 
 const DEFAULT_HARD = 85;
 const DEFAULT_SOFT = 70;
@@ -338,7 +339,15 @@ async function checkpoint($, reason, fallback) {
   if (!settings.isEnabled || !settings.isSwitching) return;
   if (!(await $.state.get(INTERACTIVE)).value) return;
   const percent = (await $.session.usage()).context?.percent;
-  if (percent === undefined || percent < settings.soft) return;
+  if (percent === undefined) return;
+  // The first turn's end after a compaction takes the fill as a baseline, so
+  // a context still past the soft threshold does not switch on every turn.
+  if ((await $.state.get(NEEDS_BASELINE)).value) {
+    await $.state.set(NEEDS_BASELINE, false);
+    await $.state.set(LAST_CHECK, percent);
+    return;
+  }
+  if (percent < settings.soft) return;
   let { value: lastCheck = null } = await $.state.get(LAST_CHECK);
   if (lastCheck !== null && percent < lastCheck) lastCheck = null;
   if (lastCheck !== null && percent - lastCheck < settings.step) return;
@@ -433,6 +442,7 @@ async function markCompacted($) {
   await $.state.set(FIRED, false);
   await $.state.set(LAST_CHECK, null);
   await $.state.set(CHECKS_USED, 0);
+  await $.state.set(NEEDS_BASELINE, true);
   await $.state.set(COMPACTED_AT, await $.clock.now());
 }
 
