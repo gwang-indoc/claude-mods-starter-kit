@@ -52,7 +52,7 @@
     {
       "name": "auto-handoff",
       "source": "./plugins/auto-handoff",
-      "description": "Writes a cold-start handoff to handoff/ before the context fills up or compacts, and offers to resume from it in the next session."
+      "description": "Writes a cold-start handoff to handoff/, switches to a fresh context at a natural checkpoint past a soft threshold, carries the handoff into every compaction, and offers to resume from it in the next session."
     }
   ]
 }

@@ -3,7 +3,7 @@
 Leave the next chat a useful starting point.
 
 ## What it does
-Writes a summary of progress, decisions and next steps into the project so a fresh conversation can continue with that summary.
+Writes a summary of progress, decisions and next steps into the project. Past 70% context it waits for a natural checkpoint, such as research done or a bug fixed and verified, then compacts to a fresh context that starts from that summary. Every compaction carries the summary into the new context.
 
 ## Install once
 First add the marketplace using START-HERE.md. Choose ONE scope below. Run the project command from the project folder. Start a fresh Claude Code session afterward.
@@ -25,12 +25,15 @@ bash scripts/try.sh auto-handoff
 ```
 
 ## Use it in Claude Code chat
-After a short task, run /autohandoff now. Read the generated handoff before trusting it. In a fresh session in the same folder, ask Claude to read handoff/LATEST.md.
+Work as usual. Past 70% context, at a natural checkpoint, it saves a handoff and compacts to a fresh context that starts from it; a toast says so. Run /autohandoff now to save by hand. Read the generated handoff before trusting it. In a fresh session in the same folder, run /autohandoff resume.
 
 ```text
 /autohandoff
 /autohandoff now
-/autohandoff threshold 85
+/autohandoff soft 70
+/autohandoff hard 85
+/autohandoff step 1
+/autohandoff switch off
 /autohandoff resume
 /autohandoff off
 ```
@@ -55,7 +58,7 @@ claude plugin disable auto-handoff@claude-mods-kit --scope user
 If installed for a project, use --scope project from that folder instead. If you used try.sh, exit that temporary Claude session. A loaded session can keep its code until closed.
 
 ## Know the limits
-Summaries can miss details and use an extra model call. The default automatic threshold is 85%. Files remain in your project after disabling; review them before sharing. It does not automatically create a new chat.
+Summaries can miss details. Past 70% each checkpoint check is an extra model call over the whole conversation, at most one per 1% of context growth and skipped mid-edit; each handoff is another. The checkpoint verdict can be wrong: /autohandoff switch off keeps saving without switching. A switch is a compaction: CLAUDE.md stays, and the chat history becomes the engine's summary plus the handoff. Without a checkpoint, a handoff is saved at 85% without switching. Files remain in your project after disabling; review them before sharing. It does not open a new chat window.
 
 ## Create your own version
 Copy [the full creation prompt](../prompts/10-auto-handoff.txt) into Claude Code. You can change the visual style, but keep its checks and off switch.

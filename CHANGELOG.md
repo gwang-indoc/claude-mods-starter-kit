@@ -1,5 +1,8 @@
 # Release notes
 
+## Unreleased
+Auto Handoff 0.2.0: past a soft threshold (default 70%) it looks for a natural checkpoint after each turn, at most one model check per 1% of context growth and none mid-edit, then writes a handoff and compacts to a fresh context. Every compaction (auto, /compact or a checkpoint) now writes a new handoff and carries it into the new context after the engine's summary, pointing at the transcript file that summary names. New commands: soft, hard, step and switch on|off; threshold stays as an alias of hard.
+
 ## 1.0.0 · October 2, 2026
 First viewer kit with ten plugins, ten creation specifications, beginner docs, safe demo launcher and teaching template. Original plugin work was built with Claude Code; this cleaned distribution, docs and packaging were prepared with Codex.
 

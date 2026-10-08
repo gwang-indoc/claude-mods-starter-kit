@@ -1,5 +1,6 @@
 export type AutoHandoffSaved = { path: string; at: number; reason: string };
 export type AutoHandoffOffer = { at: number; file: string };
+export type AutoHandoffSwitch = { at: number; percent: number };
 
 declare module "claude-code" {
   interface PluginState {
@@ -9,8 +10,17 @@ declare module "claude-code" {
       fired: boolean;
       busy: boolean;
       last: AutoHandoffSaved | null;
-      compactedAt: number;
       offer: AutoHandoffOffer | null;
+      isTurnRunning: boolean;
+      isEditOpen: boolean;
+      isTodoActive: boolean;
+      activeTasks: string[];
+      isChecking: boolean;
+      lastCheck: number | null;
+      switched: AutoHandoffSwitch | null;
+      isCarried: boolean;
+      prepared: { path: string } | null;
+      latestStart: number;
     };
   }
 }
