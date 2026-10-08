@@ -1,4 +1,5 @@
-export type AutoHandoffSaved = { path: string; at: number; reason: string };
+export type AutoHandoffSaved = { path: string; at: number; reason: string; startedAt?: number; percent?: number };
+export type AutoHandoffVerdict = { percent: number; text: string };
 export type AutoHandoffOffer = { at: number; file: string };
 export type AutoHandoffSwitch = { at: number; percent: number };
 
@@ -21,6 +22,10 @@ declare module "claude-code" {
       isCarried: boolean;
       prepared: { path: string } | null;
       latestStart: number;
+      compactedAt: number;
+      lastVerdict: AutoHandoffVerdict | null;
+      signalAge: number;
+      checksUsed: number;
     };
   }
 }

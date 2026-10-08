@@ -77,7 +77,8 @@ function world(
   });
   on("turn.start", () => ({ turnId: "t" }));
 
-  on("tool.call", () => ({ result: "ok", text: "ok" }));
+  // Bash marks a command like ls read-only, as core does.
+  on("tool.call", ($: any, e: any) => ({ result: "ok", text: "ok", ...(/^(ls|git status)\b/.test(e.command ?? "") ? { isReadOnly: true } : {}) }));
   on("session.measure", ($: any, e: any) => ({ changed: e.changed }));
   on("turn.complete", () => ({ text: "" }));
   on("ui.render", ($: any, e: any) => $.ui.resolve(e).Box({ children: [] }));
@@ -407,6 +408,7 @@ describe("checkpoint switching", () => {
     expect(seen.compactions.length).toBe(0);
     expect(seen.forks).toBe(0);
     expect(seen.logs.some((l) => l === "checkpoint check at 72%: no (edits to the parser are half done)")).toBe(true);
+    expect((await $.command.run(run(""))).text).toMatch(/Last check at 72%: no \(edits to the parser are half done\)\. 1 of 15 checks used since the last compaction\./);
 
     await $.turn.complete(turnEnd());
     await clock.settle();
@@ -449,6 +451,7 @@ describe("checkpoint switching", () => {
     await $.turn.complete(turnEnd());
     await clock.settle();
     expect(seen.checks).toBe(0);
+    expect((await $.command.run(run(""))).text).toMatch(/Last check at 75%: held back, a todo is in progress\./);
     await $.turn.start({ turnId: "t" } as any);
     await $.tool.call({ tool: "TodoWrite", todos: [{ content: "x", status: "completed", activeForm: "x" }] } as any);
 
@@ -465,6 +468,15 @@ describe("checkpoint switching", () => {
     await clock.settle();
     expect(seen.checks).toBe(0);
 
+    // A read-only command after an edit does not count as running it.
+    await $.turn.start({ turnId: "t" } as any);
+    await $.tool.call({ tool: "Edit", file_path: "/w/a.ts", old_string: "b", new_string: "c" } as any);
+    await $.tool.call({ tool: "Bash", command: "git status" } as any);
+    await $.turn.complete(turnEnd());
+    await clock.settle();
+    expect(seen.checks).toBe(0);
+    expect((await $.command.run(run(""))).text).toMatch(/held back, files were edited and nothing has run since/);
+
     // An edit followed by a command run passes to the model.
     await $.turn.start({ turnId: "t" } as any);
     await $.tool.call({ tool: "Edit", file_path: "/w/a.ts", old_string: "b", new_string: "c" } as any);
@@ -472,6 +484,60 @@ describe("checkpoint switching", () => {
     await $.turn.complete(turnEnd());
     await clock.settle();
     expect(seen.checks).toBe(1);
+  });
+
+  test("a todo left in progress for 10 turns stops holding checks back", async ($, on) => {
+    const clock = mock.clock(on, { now: START });
+    mock.store(on);
+    const { seen } = world(on);
+    seen.verdict = "CHECKPOINT: no - not yet";
+    await $.session.start({ surface: "terminal", isInteractive: true, cwd: CWD } as any);
+    seen.percent = 75;
+
+    await $.turn.start({ turnId: "t" } as any);
+    await $.tool.call({ tool: "TodoWrite", todos: [{ content: "x", status: "in_progress", activeForm: "x" }] } as any);
+    await $.turn.complete(turnEnd());
+    await clock.settle();
+    for (let i = 2; i <= 9; i++) {
+      await $.turn.complete(turnEnd());
+      await clock.settle();
+    }
+    expect(seen.checks).toBe(0);
+
+    await $.turn.complete(turnEnd());
+    await clock.settle();
+    expect(seen.checks).toBe(1);
+    expect(seen.logs.some((l) => /in progress for 10 turns without a change/.test(l))).toBe(true);
+
+    // A fresh todo update holds checks back again.
+    seen.percent = 76;
+    await $.tool.call({ tool: "TodoWrite", todos: [{ content: "x", status: "in_progress", activeForm: "x" }] } as any);
+    await $.turn.complete(turnEnd());
+    await clock.settle();
+    expect(seen.checks).toBe(1);
+  });
+
+  test("checks stop after 15 per compaction cycle and resume after a compaction", async ($, on) => {
+    const clock = mock.clock(on, { now: START });
+    mock.store(on);
+    const { seen } = world(on);
+    seen.verdict = "CHECKPOINT: no - mid-way";
+    await $.session.start({ surface: "terminal", isInteractive: true, cwd: CWD } as any);
+
+    for (let p = 70; p < 90; p++) {
+      seen.percent = p;
+      await $.turn.complete(turnEnd());
+      await clock.settle();
+    }
+    expect(seen.checks).toBe(15);
+    expect(seen.logs.filter((l) => /all 15 checkpoint checks/.test(l)).length).toBe(1);
+    expect((await $.command.run(run(""))).text).toMatch(/15 of 15 checks used since the last compaction\./);
+
+    await $.session.compact({ trigger: "auto", messages: MSGS } as any);
+    seen.percent = 71;
+    await $.turn.complete(turnEnd());
+    await clock.settle();
+    expect(seen.checks).toBe(16);
   });
 
   test("a checkpoint found while a new turn runs waits for that turn to end", async ($, on) => {
@@ -601,15 +667,42 @@ describe("handoff carried into compaction", () => {
     expect(off.messages?.length).toBe(1);
     expect(seen.forks).toBe(0);
 
-    // An older handoff is never carried in when the new one fails.
+    // The new one fails and nothing was written since the last compaction.
     await $.command.run(run("on"));
-    await $.command.run(run("now"));
-    await clock.settle();
-    expect(seen.forks).toBe(1);
     seen.failNext = true;
     const failed = await $.session.compact({ trigger: "auto", messages: MSGS } as any);
-    expect(seen.forks).toBe(2);
+    expect(seen.forks).toBe(1);
     expect(failed.messages?.length).toBe(1);
+  });
+
+  test("when the new handoff fails, the latest one since the last compaction is carried with its age", async ($, on) => {
+    const clock = mock.clock(on, { now: START });
+    mock.store(on);
+    const { seen } = world(on);
+    await $.session.start({ surface: "terminal", isInteractive: true, cwd: CWD } as any);
+
+    seen.percent = 86;
+    await $.session.measure(measure(86));
+    await clock.settle();
+    expect(seen.forks).toBe(1);
+
+    await clock.advance(4 * 60_000);
+    seen.failNext = true;
+    const out = await $.session.compact({ trigger: "auto", messages: MSGS } as any);
+    expect(seen.forks).toBe(2);
+    expect(out.messages?.length).toBe(2);
+    const text = out.messages?.[1].text ?? "";
+    expect(text).toMatch(/^\[auto-handoff\] The conversation was just compacted\. A fresh handoff could not be written/);
+    expect(text).toContain("handoff/handoff-2026-10-01-090507.md");
+    expect(text).toContain("written at 86% context fill, about 4 min before the compaction");
+    expect(text).toContain("the summary wins");
+    expect(text).toContain("## 1. Session intent");
+
+    // That handoff came before this compaction, so the next one has nothing to fall back on.
+    await clock.advance(60_000);
+    seen.failNext = true;
+    const next = await $.session.compact({ trigger: "auto", messages: MSGS } as any);
+    expect(next.messages?.length).toBe(1);
   });
 
   test("carriedHandoff and parseCheckpoint", async () => {
@@ -623,4 +716,31 @@ describe("handoff carried into compaction", () => {
       .toEqual({ isCheckpoint: false, why: "unreadable verdict" });
     expect(parseCheckpoint({ isAnswered: false, reason: "api-error" } as any).isCheckpoint).toBe(false);
   });
+});
+
+test("overlapping writes in the same second pick distinct names, and the later fork keeps LATEST.md", async () => {
+  const fs = new Map<string, string>();
+  const tick = async () => { for (let i = 0; i < 5; i++) await null; };
+  let clock = START;
+  let latest = 0;
+  let release = () => {};
+  const gate = new Promise<void>((r) => (release = r));
+  const io = {
+    fork: async () => { await gate; return { isAnswered: true, text: "LATEST: x\n\n## 1. Session intent\nx\n" }; },
+    read: async (p: string) => { await tick(); return fs.get(p) ?? ""; },
+    write: async (p: string, t: string) => { await tick(); fs.set(p, t); },
+    exists: async (p: string) => { await tick(); return fs.has(p); },
+    now: async () => clock++,
+    latestStart: async () => { await tick(); return latest; },
+    setLatestStart: async (v: number) => { await tick(); latest = v; },
+    setLast: async () => {},
+    toast: () => {},
+    log: () => {},
+  };
+  const earlier = writeHandoff(io, { cwd: CWD, reason: "a", isForced: true });
+  const later = writeHandoff(io, { cwd: CWD, reason: "b", isForced: true });
+  release();
+  const [a, b] = await Promise.all([earlier, later]);
+  expect(a.path).not.toBe(b.path);
+  expect(firstOf(fs.get(`${CWD}/handoff/LATEST.md`))).toBe((b.path ?? "").replace("handoff/", ""));
 });

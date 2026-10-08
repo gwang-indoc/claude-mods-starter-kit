@@ -18,10 +18,19 @@ const SWITCHED = { plugin: "auto-handoff", key: "switched" };
 const CARRIED = { plugin: "auto-handoff", key: "isCarried" };
 const PREPARED = { plugin: "auto-handoff", key: "prepared" };
 const LATEST_START = { plugin: "auto-handoff", key: "latestStart" };
+const COMPACTED_AT = { plugin: "auto-handoff", key: "compactedAt" };
+const VERDICT = { plugin: "auto-handoff", key: "lastVerdict" };
+const SIGNAL_AGE = { plugin: "auto-handoff", key: "signalAge" };
+const CHECKS_USED = { plugin: "auto-handoff", key: "checksUsed" };
 
 const DEFAULT_HARD = 85;
 const DEFAULT_SOFT = 70;
 const DEFAULT_STEP = 1;
+// Checks per compaction cycle: at 1% steps, 70% to 85% and no further.
+const MAX_CHECKS = 15;
+// Main turns a todo or task may sit in progress before it stops holding
+// checks back (a model that never marks one done would block switching).
+const STALE_TURNS = 10;
 const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
 
 export const HANDOFF_PROMPT = `Write a cold-start handoff for this session, so a new agent with no access to this conversation can pick up the work exactly where it stands. Do not call any tools. Answer with the document only.
@@ -106,21 +115,24 @@ export function register(on, options) {
     return next(e);
   });
 
-  // Free signals for the checkpoint pre-filter: an edit with nothing run
-  // after it, or a todo or task still in progress, means work is mid-way.
+  // Free signals for the checkpoint pre-filter: an edit with no command run
+  // after it (a read-only one like ls does not count), or a todo or task
+  // still in progress, means work is mid-way.
   on("tool.call", async ($, e, next) => {
     const result = await next(e);
     if (e.agentId || result?.deny || result?.isError) return result;
     if (EDIT_TOOLS.has(e.tool)) {
       await $.state.set(EDIT_OPEN, true);
-    } else if (e.tool === "Bash") {
+    } else if (e.tool === "Bash" && !result?.isReadOnly) {
       await $.state.set(EDIT_OPEN, false);
     } else if (e.tool === "TodoWrite") {
       await $.state.set(TODO_ACTIVE, (e.todos ?? []).some((t) => t.status === "in_progress"));
+      await $.state.set(SIGNAL_AGE, 0);
     } else if (e.tool === "TaskUpdate" && e.status) {
       const { value: tasks = [] } = await $.state.get(ACTIVE_TASKS);
       const rest = tasks.filter((id) => id !== e.taskId);
       await $.state.set(ACTIVE_TASKS, e.status === "in_progress" ? [...rest, e.taskId] : rest);
+      await $.state.set(SIGNAL_AGE, 0);
     }
     return result;
   }).catch(($, e, next) => next(e));
@@ -133,6 +145,11 @@ export function register(on, options) {
     await $.state.set(RUNNING, false);
     const { value: offer = null } = await $.state.get(OFFER);
     if (offer) await $.state.set(OFFER, null);
+    const { value: age = 0 } = await $.state.get(SIGNAL_AGE);
+    await $.state.set(SIGNAL_AGE, age + 1);
+    if (age + 1 === STALE_TURNS && (await isWorkSignalled($))) {
+      $.ui.log(`a todo or task has been in progress for ${STALE_TURNS} turns without a change; it no longer holds checkpoint checks back`);
+    }
     const reason = e.reason;
     $.clock.after(0, () => {
       void checkpoint($, reason, fallback).catch((err) => {
@@ -172,14 +189,16 @@ export function register(on, options) {
 
   // Every compaction of the main conversation (auto, /compact, a checkpoint
   // switch): write a new handoff (a switch brings the one it just wrote), let
-  // the engine compact, then put the handoff after the engine's summary.
+  // the engine compact, then put the handoff after the engine's summary. When
+  // the new one cannot be written (the fork can fail on a full context), the
+  // latest one since the last compaction goes in instead, marked with its age.
   on("session.compact", async ($, e, next) => {
     if (e.trigger === "precompute" || !!e.agentId) return next(e);
     const settings = await settingsOf($, fallback);
     let handoff = null;
     if (settings.isEnabled) {
       const { value: prepared = null } = await $.state.get(PREPARED);
-      handoff = prepared ?? (await handoffForCompaction($, e.trigger));
+      handoff = prepared ?? (await handoffForCompaction($, e.trigger)) ?? (await earlierHandoff($));
     } else {
       $.ui.log("compaction without a handoff, auto handoffs are off");
     }
@@ -214,7 +233,13 @@ export function register(on, options) {
         if (file) lastLine = `No handoff this session. Latest on disk is handoff/${file}, ${ago(now - (stat?.mtimeMs ?? now))}.`;
       }
       const switchLine = switched ? `Last checkpoint switch ${ago(now - switched.at)}, at ${switched.percent}%.` : "";
-      return { text: statusText(settings, usage.context?.percent, lastLine, switchLine) };
+      const { value: verdict = null } = await $.state.get(VERDICT);
+      const { value: used = 0 } = await $.state.get(CHECKS_USED);
+      const checkLine = [
+        verdict ? `Last check at ${verdict.percent}%: ${verdict.text}.` : "",
+        used > 0 ? `${used} of ${MAX_CHECKS} checks used since the last compaction.` : "",
+      ].filter(Boolean).join(" ");
+      return { text: statusText(settings, usage.context?.percent, lastLine, switchLine, checkLine) };
     }
 
     if (verb === "on" || verb === "off") {
@@ -317,18 +342,25 @@ async function checkpoint($, reason, fallback) {
   let { value: lastCheck = null } = await $.state.get(LAST_CHECK);
   if (lastCheck !== null && percent < lastCheck) lastCheck = null;
   if (lastCheck !== null && percent - lastCheck < settings.step) return;
-  if (reason !== "answer") return;
-  if ((await $.state.get(EDIT_OPEN)).value) return;
-  if ((await $.state.get(TODO_ACTIVE)).value) return;
-  if (((await $.state.get(ACTIVE_TASKS)).value ?? []).length > 0) return;
+  const { value: used = 0 } = await $.state.get(CHECKS_USED);
+  if (used >= MAX_CHECKS) return;
+  const held = await heldBack($, reason);
+  if (held) {
+    await $.state.set(VERDICT, { percent, text: `held back, ${held}` });
+    return;
+  }
   if ((await $.state.get(BUSY)).value || (await $.state.get(CHECKING)).value) return;
 
   await $.state.set(CHECKING, true);
   try {
     await $.state.set(LAST_CHECK, percent);
+    await $.state.set(CHECKS_USED, used + 1);
+    if (used + 1 === MAX_CHECKS) $.ui.log(`all ${MAX_CHECKS} checkpoint checks for this cycle are used; the next compaction starts a new cycle`);
     const reply = await $.model.fork({ prompt: CHECKPOINT_PROMPT });
     const verdict = parseCheckpoint(reply);
-    $.ui.log(`checkpoint check at ${percent}%: ${verdict.isCheckpoint ? "yes" : "no"} (${verdict.why})`);
+    const text = `${verdict.isCheckpoint ? "yes" : "no"} (${verdict.why})`;
+    await $.state.set(VERDICT, { percent, text });
+    $.ui.log(`checkpoint check at ${percent}%: ${text}`);
     if (!verdict.isCheckpoint) return;
     await switchContext($, percent);
   } finally {
@@ -380,9 +412,28 @@ async function switchContext($, percent) {
   $.ui.toast(`Checkpoint at ${percent}%: switched to a fresh context with ${handoff.path}`, { timeoutMs: 8000 });
 }
 
+// Why the free pre-filter holds a check back, or "" when it does not. A todo
+// or task unchanged for STALE_TURNS main turns no longer counts.
+async function heldBack($, reason) {
+  if (reason !== "answer") return `the turn ended with ${reason}`;
+  if ((await $.state.get(EDIT_OPEN)).value) return "files were edited and nothing has run since";
+  const { value: age = 0 } = await $.state.get(SIGNAL_AGE);
+  if (age >= STALE_TURNS) return "";
+  if ((await $.state.get(TODO_ACTIVE)).value) return "a todo is in progress";
+  if (((await $.state.get(ACTIVE_TASKS)).value ?? []).length > 0) return "a task is in progress";
+  return "";
+}
+
+async function isWorkSignalled($) {
+  if ((await $.state.get(TODO_ACTIVE)).value) return true;
+  return ((await $.state.get(ACTIVE_TASKS)).value ?? []).length > 0;
+}
+
 async function markCompacted($) {
   await $.state.set(FIRED, false);
   await $.state.set(LAST_CHECK, null);
+  await $.state.set(CHECKS_USED, 0);
+  await $.state.set(COMPACTED_AT, await $.clock.now());
 }
 
 // The handoff as the message that follows the engine's summary, or "" when
@@ -391,19 +442,30 @@ async function carriedText($, handoff) {
   const { value: cwd = "" } = await $.state.get(CWD);
   const text = await $.fs.read(`${cwd}/${handoff.path}`).catch(() => "");
   if (!text.trim()) return "";
-  return carriedHandoff(handoff.path, text);
+  if (!handoff.isEarlier) return carriedHandoff(handoff.path, text);
+  const minutes = Math.max(1, Math.round(((await $.clock.now()) - handoff.at) / 60_000));
+  return carriedHandoff(handoff.path, text, { percent: handoff.percent, minutes });
 }
 
 // A new handoff for this compaction, so it covers the conversation up to the
 // last turn. Written even while another handoff is being written (that one
 // forked earlier, and a hook may not wait out its budget for it). Null when
-// none could be written: an older handoff is never carried in, as it would be
-// marked authoritative while missing the latest work.
+// none could be written.
 async function handoffForCompaction($, trigger) {
   const { value: cwd = "" } = await $.state.get(CWD);
   $.ui.log(`writing a handoff before ${trigger} compaction`);
   const saved = await writeHandoff(ioFor($), { cwd, reason: `before ${trigger} compaction`, isForced: true });
   return saved.path ? { path: saved.path } : null;
+}
+
+// The newest handoff forked since the last compaction (the hard threshold's,
+// say), or null. One from before it would only repeat what the summary holds.
+async function earlierHandoff($) {
+  const { value: last = null } = await $.state.get(LAST);
+  const { value: compactedAt = 0 } = await $.state.get(COMPACTED_AT);
+  if (!last || !(last.startedAt > compactedAt)) return null;
+  $.ui.log(`no new handoff for this compaction; carrying ${last.path} from ${last.percent ?? "?"}%`);
+  return { path: last.path, at: last.at, percent: last.percent, isEarlier: true };
 }
 
 async function settingsOf($, fallback) {
@@ -418,6 +480,7 @@ function ioFor($) {
     write: (path, text) => $.fs.write(path, text),
     exists: (path) => $.fs.exists(path),
     now: () => $.clock.now(),
+    percent: async () => (await $.session.usage()).context?.percent,
     isBusy: async () => (await $.state.get(BUSY)).value === true,
     setBusy: (v) => $.state.set(BUSY, v),
     setLast: (v) => $.state.set(LAST, v),
@@ -432,7 +495,8 @@ function ioFor($) {
 // LATEST.md at it and makes sure git ignores the folder. Takes plain functions.
 // A forced write (a compaction's) runs beside a write already under way; of
 // two that overlap, the one that forked later keeps LATEST.md, whichever ends
-// first, and the other's file is kept beside it.
+// first, and the other's file is kept beside it. Everything after the fork
+// runs one write at a time, so two never pick the same name.
 export async function writeHandoff(io, { cwd, reason, isForced = false }) {
   if (!cwd) return { skipped: "no working directory" };
   if (!isForced) {
@@ -441,6 +505,7 @@ export async function writeHandoff(io, { cwd, reason, isForced = false }) {
   }
   try {
     const startedAt = await io.now();
+    const percent = io.percent ? await io.percent() : undefined;
     const reply = await io.fork(HANDOFF_PROMPT);
     if (!reply.isAnswered) {
       io.log(`no handoff written, the fork returned ${reply.reason}`);
@@ -449,23 +514,25 @@ export async function writeHandoff(io, { cwd, reason, isForced = false }) {
     }
     const { summary, body } = splitReply(reply.text);
     if (!body.trim()) throw new Error("The summary response was empty");
-    const now = await io.now();
-    const dir = `${cwd}/handoff`;
-    const stamp = timestamp(now);
-    let name = `handoff-${stamp}.md`;
-    for (let n = 2; await io.exists(`${dir}/${name}`); n++) name = `handoff-${stamp}-${n}.md`;
-    const project = cwd.split("/").filter(Boolean).pop() ?? "project";
-    const header = `# Handoff, ${project}, ${humanTime(now)}\n\n_Written automatically by auto-handoff (${reason})._\n\n`;
-    await io.write(`${dir}/${name}`, header + body.trim() + "\n");
-    const path = `handoff/${name}`;
-    const isNewest = startedAt >= (await io.latestStart());
-    if (isNewest) {
-      await io.setLatestStart(startedAt);
-      await io.write(`${dir}/LATEST.md`, `${name}\n${summary}\n`);
-      await updateActiveProject(io, dir, name, summary);
-      await io.setLast({ path, at: now, reason });
-    }
-    const gitignore = await ensureIgnored(io, cwd);
+    const { path, isNewest, gitignore } = await oneAtATime(async () => {
+      const now = await io.now();
+      const dir = `${cwd}/handoff`;
+      const stamp = timestamp(now);
+      let name = `handoff-${stamp}.md`;
+      for (let n = 2; await io.exists(`${dir}/${name}`); n++) name = `handoff-${stamp}-${n}.md`;
+      const project = cwd.split("/").filter(Boolean).pop() ?? "project";
+      const header = `# Handoff, ${project}, ${humanTime(now)}\n\n_Written automatically by auto-handoff (${reason})._\n\n`;
+      await io.write(`${dir}/${name}`, header + body.trim() + "\n");
+      const path = `handoff/${name}`;
+      const isNewest = startedAt >= (await io.latestStart());
+      if (isNewest) {
+        await io.setLatestStart(startedAt);
+        await io.write(`${dir}/LATEST.md`, `${name}\n${summary}\n`);
+        await updateActiveProject(io, dir, name, summary);
+        await io.setLast({ path, at: now, reason, startedAt, percent });
+      }
+      return { path, isNewest, gitignore: await ensureIgnored(io, cwd) };
+    });
     io.toast(`Handoff saved to ${path}`);
     io.log(`saved ${path}${isNewest ? "" : " (a newer handoff keeps LATEST.md)"}${gitignore ? `, ${gitignore}` : ""}`);
     return { path, gitignore };
@@ -478,10 +545,27 @@ export async function writeHandoff(io, { cwd, reason, isForced = false }) {
   }
 }
 
+// The tail of the handoff's writing, from picking a name to LATEST.md, one
+// write at a time. The queue is this module's; a reload starts a new one.
+let queue = Promise.resolve();
+function oneAtATime(fn) {
+  const run = queue.then(fn, fn);
+  queue = run.catch(() => {});
+  return run;
+}
+
 // The engine's summary names the full transcript file; the lookup sentence
 // points at it rather than at a path this plugin cannot read on every tier.
-export function carriedHandoff(path, text) {
-  return `[auto-handoff] The conversation was just compacted. Below is the handoff written right before it (${path}). For decisions, current state and next steps, treat this handoff as authoritative and the summary above as background. If a detail is missing from both, search the full transcript file the summary names with grep for that detail; never read it whole.\n\n${text.trim()}\n`;
+// An earlier handoff (the new one failed) says how old it is and yields to
+// the summary on what came after it.
+const LOOKUP =
+  "If a detail is missing from both, search the full transcript file the summary names with grep for that detail; never read it whole.";
+export function carriedHandoff(path, text, earlier) {
+  if (!earlier) {
+    return `[auto-handoff] The conversation was just compacted. Below is the handoff written right before it (${path}). For decisions, current state and next steps, treat this handoff as authoritative and the summary above as background. ${LOOKUP}\n\n${text.trim()}\n`;
+  }
+  const fill = earlier.percent === undefined ? "" : ` at ${earlier.percent}% context fill,`;
+  return `[auto-handoff] The conversation was just compacted. A fresh handoff could not be written, so below is the latest one from before it (${path}), written${fill} about ${earlier.minutes} min before the compaction. Treat it as authoritative for decisions and next steps up to that point; where the summary above describes later work, the summary wins. ${LOOKUP}\n\n${text.trim()}\n`;
 }
 
 export function parseCheckpoint(reply) {
@@ -553,7 +637,7 @@ export function ago(ms) {
   return d === 1 ? "yesterday" : `${d} days ago`;
 }
 
-function statusText(settings, percent, lastLine, switchLine) {
+function statusText(settings, percent, lastLine, switchLine, checkLine) {
   const fill = percent === undefined ? "not measured yet" : `${percent}%`;
   const switching = settings.isSwitching
     ? `switches to a fresh context at a checkpoint from ${settings.soft}% (checked every ${settings.step}%)`
@@ -563,6 +647,7 @@ function statusText(settings, percent, lastLine, switchLine) {
     `It ${switching}, and writes a handoff without switching at the hard threshold ${settings.threshold}%.`,
     lastLine,
     switchLine,
+    checkLine,
     "Commands are /autohandoff now, resume, soft <n>, hard <n>, step <n>, switch on|off, on, off.",
   ].filter(Boolean).join("\n");
 }
